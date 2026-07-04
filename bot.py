@@ -6,10 +6,14 @@ Admin-only bot with APK processing functionality
 
 import os
 import logging
+import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import Application, CommandHandler, MessageHandler, ConversationHandler, filters, ContextTypes
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ConversationHandler, 
+    filters, ContextTypes
+)
 
 from apk_processor import APKProcessor
 from config import config
@@ -123,7 +127,7 @@ class APKBot:
             await update.message.reply_text(
                 f"✅ Файл загружен: {file.file_name}\n\n"
                 f"Всего файлов: {len(self.user_sessions[user_id]['files'])}\n\n"
-                "Отправьте еще файлы или напишите 'Готово':",
+                "Отправьте еще файлы или нажмите 'Готово':",
                 reply_markup=ReplyKeyboardMarkup([["✅ Готово"]], resize_keyboard=True)
             )
             return WAITING_FILES
@@ -172,7 +176,7 @@ class APKBot:
         self.user_sessions[user_id]['link'] = link
         
         await update.message.reply_text(
-            "📝 Укажите заголовок для таблицы (или 'Пропустить' для стандартного):",
+            "📝 Укажите заголовок для таблицы (или нажмите 'Пропустить' для стандартного):",
             reply_markup=ReplyKeyboardMarkup([["⏭️ Пропустить"]], resize_keyboard=True)
         )
         
@@ -198,7 +202,7 @@ class APKBot:
         return str(file_path)
     
     async def _process_apks(self, update: Update, user_id: int):
-        """Process APK files"""
+        """Process APK files asynchronously"""
         session = self.user_sessions[user_id]
         files = session['files']
         link = session['link']
@@ -231,23 +235,39 @@ class APKBot:
         
         # Send results
         if processed_files:
+            await update.message.reply_text("✅ Готово! Отправляю файлы...")
             for output_path in processed_files:
-                with open(output_path, 'rb') as f:
-                    await update.message.reply_document(
-                        document=f,
-                        caption=f"✅ {Path(output_path).name}",
-                        reply_markup=ReplyKeyboardMarkup([["📋 Главное меню"]], resize_keyboard=True)
-                    )
+                try:
+                    with open(output_path, 'rb') as f:
+                        await update.message.reply_document(
+                            document=f,
+                            caption=f"✅ {Path(output_path).name}",
+                        )
+                except Exception as e:
+                    logger.error(f"Error sending file {output_path}: {e}")
+                    errors.append(f"❌ Ошибка отправки {Path(output_path).name}")
         
         if errors:
             await update.message.reply_text(
                 "⚠️ Ошибки при обработке:\n\n" + "\n".join(errors)
             )
         
-        await processing_msg.delete()
+        try:
+            await processing_msg.delete()
+        except:
+            pass
+        
+        # Show main menu button
+        keyboard = [["📋 Главное меню"]]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        await update.message.reply_text(
+            "Что дальше?",
+            reply_markup=reply_markup
+        )
         
         # Cleanup
-        del self.user_sessions[user_id]
+        if user_id in self.user_sessions:
+            del self.user_sessions[user_id]
     
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Cancel operation"""
@@ -266,9 +286,22 @@ def main():
     """Start the bot"""
     load_dotenv()
     
+    # Validate configuration
+    if not config.BOT_TOKEN:
+        logger.error("❌ BOT_TOKEN is not set. Please check your .env file")
+        return
+    
+    if not config.ADMIN_IDS:
+        logger.error("❌ ADMIN_IDS is not set. Please check your .env file")
+        return
+    
     # Create necessary directories
     Path(config.WORK_DIR).mkdir(parents=True, exist_ok=True)
     Path(config.OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    
+    logger.info("🚀 Starting APK Bot...")
+    logger.info(f"Admin IDs: {config.ADMIN_IDS}")
+    logger.info(f"Default branding: {config.DEFAULT_BRANDING}")
     
     # Initialize bot
     bot = APKBot()
@@ -302,7 +335,7 @@ def main():
     
     app.add_handler(conv_handler)
     
-    logger.info("Bot started!")
+    logger.info("✅ Bot started! Waiting for commands...")
     app.run_polling()
 
 
