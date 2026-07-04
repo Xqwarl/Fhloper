@@ -5,15 +5,18 @@ import shutil
 import logging
 import subprocess
 import zipfile
+import asyncio
 from pathlib import Path
 from datetime import datetime
 from xml.dom import minidom
+from concurrent.futures import ThreadPoolExecutor
 
 from config import config
 from table_generator import TableGenerator
 from smali_modifier import SmaliModifier
 
 logger = logging.getLogger(__name__)
+executor = ThreadPoolExecutor(max_workers=2)
 
 
 class APKProcessor:
@@ -29,7 +32,7 @@ class APKProcessor:
     async def process_apk(self, input_path: str, subscription_link: str, 
                          title: str, branding: str) -> str:
         """
-        Process APK file:
+        Process APK file asynchronously:
         1. Decompile with apktool
         2. Modify smali files with table
         3. Add subscription link
@@ -41,6 +44,20 @@ class APKProcessor:
         if not input_path.exists():
             raise FileNotFoundError(f"APK file not found: {input_path}")
         
+        # Run blocking operation in thread pool
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            executor,
+            self._process_apk_sync,
+            input_path,
+            subscription_link,
+            title,
+            branding
+        )
+    
+    def _process_apk_sync(self, input_path: Path, subscription_link: str, 
+                         title: str, branding: str) -> str:
+        """Synchronous APK processing"""
         # Create unique work directory
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         work_apk_dir = self.work_dir / f"apk_{timestamp}"
@@ -89,7 +106,7 @@ class APKProcessor:
             "-o", str(output_dir)
         ]
         
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
             raise RuntimeError(f"apktool decompile failed: {result.stderr}")
     
@@ -211,7 +228,7 @@ class APKProcessor:
             "-o", str(output_apk)
         ]
         
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
             raise RuntimeError(f"apktool build failed: {result.stderr}")
     
@@ -220,39 +237,47 @@ class APKProcessor:
         # For production, you'd use a proper keystore
         # This uses the default debug key
         
-        cmd = [
-            "jarsigner",
-            "-verbose",
-            "-sigalg", "SHA1withRSA",
-            "-digestalg", "SHA1",
-            "-keystore", str(self._get_debug_keystore()),
-            "-storepass", "android",
-            "-keypass", "android",
-            str(unsigned_apk),
-            "androiddebugkey"
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            # Try alternative: use zipalign
+        try:
+            cmd = [
+                "jarsigner",
+                "-verbose",
+                "-sigalg", "SHA1withRSA",
+                "-digestalg", "SHA1",
+                "-keystore", str(self._get_debug_keystore()),
+                "-storepass", "android",
+                "-keypass", "android",
+                str(unsigned_apk),
+                "androiddebugkey"
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode != 0:
+                # Try alternative: use zipalign
+                self._zipalign_apk(unsigned_apk, signed_apk)
+                return
+            
+            # Align with zipalign
             self._zipalign_apk(unsigned_apk, signed_apk)
-            return
-        
-        # Align with zipalign
-        self._zipalign_apk(unsigned_apk, signed_apk)
+        except Exception as e:
+            logger.warning(f"Signing failed, using zipalign: {e}")
+            self._zipalign_apk(unsigned_apk, signed_apk)
     
     def _zipalign_apk(self, input_apk: Path, output_apk: Path):
         """Align APK with zipalign"""
-        cmd = [
-            "zipalign",
-            "-v", "4",
-            str(input_apk),
-            str(output_apk)
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            # If zipalign fails, just copy
+        try:
+            cmd = [
+                "zipalign",
+                "-v", "4",
+                str(input_apk),
+                str(output_apk)
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode != 0:
+                # If zipalign fails, just copy
+                shutil.copy(input_apk, output_apk)
+        except Exception as e:
+            logger.warning(f"zipalign failed, copying file: {e}")
             shutil.copy(input_apk, output_apk)
     
     def _get_debug_keystore(self) -> Path:
